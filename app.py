@@ -21,10 +21,11 @@ import streamlit as st
 
 try:
     import openai
-except ImportError:  # app still works in offline-heuristic mode
+except ImportError:  # app can load without the SDK, but evaluations require it
     openai = None
 
 DB_PATH = os.environ.get("RFP_DB", "rfp_evaluator.db")
+OPENAI_MODEL = "gpt-4o-mini"
 
 # ----------------------------------------------------------------------------
 # RFP TEMPLATE RUBRIC (taken from the attached template)
@@ -228,13 +229,6 @@ def parse_json(text):
         return json.loads(text[s:e + 1])
 
 
-def list_openai_models(api_key):
-    if openai is None:
-        raise RuntimeError("`openai` package not installed. Run: pip install openai")
-    client = openai.OpenAI(api_key=api_key)
-    return sorted(model.id for model in client.models.list().auto_paging_iter())
-
-
 def evaluate_llm(text, api_key, model):
     if openai is None:
         raise RuntimeError("`openai` package not installed. Run: pip install openai")
@@ -258,37 +252,19 @@ def evaluate_llm(text, api_key, model):
     return data
 
 
-def evaluate_heuristic(text):
-    """Offline keyword screen. Rough triage only - NOT a substitute for the LLM evaluation or human review."""
-    low = text.lower()
-    gates = {}
-    for n, _, kws in GATES:
-        hits = [k for k in kws if k in low]
-        res = "Pass" if len(hits) >= 3 else "Clarify" if hits else "Fail"
-        gates[n] = {"result": res, "evidence": f"Keywords found: {', '.join(hits) or 'none'}", "gap": "Keyword screen only - verify evidence."}
-    scores = {}
-    for k, n, w, d, kws in CRITERIA:
-        hits = [x for x in kws if x in low]
-        ratio = len(hits) / max(len(kws), 1)
-        s = 0 if not hits else min(5, 1 + round(ratio * 4))
-        scores[k] = {"score": s, "evidence": f"Keywords: {', '.join(hits) or 'none'}", "gaps": "Keyword screen only."}
-    return {"gates": gates, "scores": scores,
-            "summary": "Offline heuristic keyword screen (no API key used). Use for quick triage; run the AI evaluator for evidence-based scoring.",
-            "clarifications": [], "extracted": {}, "_tokens": (0, 0)}
-
-
-def run_evaluation(resp_id, mode, api_key, model):
+def run_evaluation(resp_id, api_key):
     r = query("SELECT * FROM responses WHERE id=?", (resp_id,)).iloc[0]
     t0 = time.time()
     status, err, data = "ok", "", None
     try:
-        data = evaluate_llm(r["text"], api_key, model) if mode.startswith("AI") else evaluate_heuristic(r["text"])
+        data = evaluate_llm(r["text"], api_key, OPENAI_MODEL)
     except Exception as e:  # noqa
         status, err = "error", str(e)[:500]
     dur = round(time.time() - t0, 2)
     if status == "error":
         rid = execute("""INSERT INTO runs(response_id,mode,model,started,duration_s,status,error,total_score,rating,gates_passed)
-                         VALUES(?,?,?,?,?,?,?,?,?,?)""", (resp_id, mode, model, now(), dur, status, err, 0, "Error", 0))
+                         VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                      (resp_id, "AI (OpenAI API)", OPENAI_MODEL, now(), dur, status, err, 0, "Error", 0))
         log("run", rid, "failed", err)
         return rid, None
     # normalise
@@ -310,7 +286,7 @@ def run_evaluation(resp_id, mode, api_key, model):
     tin, tout = data.get("_tokens", (0, 0))
     rid = execute("""INSERT INTO runs(response_id,mode,model,started,duration_s,total_score,rating,gates_passed,gates_json,
                      scores_json,summary,tokens_in,tokens_out,status,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (resp_id, mode, model if mode.startswith("AI") else "heuristic", now(), dur, total, rating, int(ok),
+                  (resp_id, "AI (OpenAI API)", OPENAI_MODEL, now(), dur, total, rating, int(ok),
                    json.dumps(gates), json.dumps(scores), summary, tin, tout, "ok", ""))
     log("run", rid, "completed", f"response {resp_id}: {total}/100, {rating}")
     return rid, data.get("extracted", {})
@@ -468,7 +444,7 @@ def page_import():
                 st.rerun()
 
 
-def page_run(api_key, model):
+def page_run(api_key):
     st.header("Run evaluator")
     with st.expander("Validation reference: RFP template rubric", expanded=False):
         st.markdown("**Mandatory gates** (all must pass before ranking)")
@@ -484,14 +460,14 @@ def page_run(api_key, model):
         return
     labels = {int(r.id): f"#{r.id} - {r.supplier} - {r.rfp_ref or 'no ref'} ({r.filename})" for r in resp.itertuples()}
     chosen = st.multiselect("Responses to evaluate", list(labels), format_func=labels.get, default=list(labels)[:1])
-    mode = st.radio("Evaluation mode", ["AI (OpenAI API)", "Offline heuristic (no key, rough triage)"], horizontal=True)
+    st.caption(f"Evaluations use OpenAI ({OPENAI_MODEL}). Add your API key in the sidebar to run evaluations.")
     auto = st.checkbox("Auto-add extracted batteries / materials to the Batteries tab", value=True)
-    if mode.startswith("AI") and not api_key:
-        st.warning("Enter your OpenAI API key in the sidebar to use AI mode.")
-    if st.button("Run evaluator", type="primary", disabled=not chosen or (mode.startswith("AI") and not api_key)):
+    if not api_key:
+        st.warning("Enter your OpenAI API key in the sidebar to run evaluations.")
+    if st.button("Run evaluator", type="primary", disabled=not chosen or not api_key):
         bar = st.progress(0.0)
         for i, rid in enumerate(chosen, 1):
-            run_id, ext = run_evaluation(rid, "AI (OpenAI API)" if mode.startswith("AI") else "Heuristic", api_key, model)
+            run_id, ext = run_evaluation(rid, api_key)
             r = query("SELECT * FROM runs WHERE id=?", (run_id,)).iloc[0]
             if r["status"] == "error":
                 st.error(f"{labels[rid]}: {r['error']}")
@@ -732,34 +708,7 @@ def main():
                             value=st.session_state.get("openai_api_key", os.environ.get("OPENAI_API_KEY", "")),
                             help="Held in this browser session only. It is never written to the database.")
         st.session_state["openai_api_key"] = key
-        refresh_models = st.button("Refresh available models", disabled=not key)
-        if not key:
-            st.session_state["_openai_models_key"] = ""
-            st.session_state["_openai_models"] = []
-            st.session_state["_openai_models_error"] = ""
-        elif key != st.session_state.get("_openai_models_key") or refresh_models:
-            st.session_state.pop("openai_model_choice", None)
-            try:
-                st.session_state["_openai_models"] = list_openai_models(key)
-                st.session_state["_openai_models_error"] = ""
-            except RuntimeError as e:
-                st.session_state["_openai_models"] = []
-                st.session_state["_openai_models_error"] = str(e)
-            except openai.OpenAIError as e:
-                st.session_state["_openai_models"] = []
-                st.session_state["_openai_models_error"] = str(e)
-            st.session_state["_openai_models_key"] = key
-        if st.session_state.get("_openai_models_error"):
-            st.error("Could not load OpenAI models. You can still enter a model ID manually. "
-                     + st.session_state["_openai_models_error"])
-        model_options = ["Enter model ID manually"] + st.session_state.get("_openai_models", [])
-        model_choice = st.selectbox("OpenAI model", model_options, key="openai_model_choice")
-        if model_choice == "Enter model ID manually":
-            model = st.text_input("Model ID", value=st.session_state.get("model", "gpt-4o-mini"))
-        else:
-            model = model_choice
-        st.session_state["model"] = model
-        st.caption("Key status: " + ("✅ entered" if key else "❌ missing (offline heuristic mode still works)"))
+        st.caption("Key status: " + ("✅ entered" if key else "❌ missing (required to run evaluations)"))
         st.divider()
         if st.button("Load demo data"):
             load_demo()
@@ -772,7 +721,7 @@ def main():
     with tabs[1]:
         page_import()
     with tabs[2]:
-        page_run(key, model)
+        page_run(key)
     with tabs[3]:
         page_runs()
     with tabs[4]:
