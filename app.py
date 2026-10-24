@@ -20,9 +20,9 @@ import pandas as pd
 import streamlit as st
 
 try:
-    import anthropic
+    import openai
 except ImportError:  # app still works in offline-heuristic mode
-    anthropic = None
+    openai = None
 
 DB_PATH = os.environ.get("RFP_DB", "rfp_evaluator.db")
 
@@ -228,17 +228,33 @@ def parse_json(text):
         return json.loads(text[s:e + 1])
 
 
+def list_openai_models(api_key):
+    if openai is None:
+        raise RuntimeError("`openai` package not installed. Run: pip install openai")
+    client = openai.OpenAI(api_key=api_key)
+    return sorted(model.id for model in client.models.list().auto_paging_iter())
+
+
 def evaluate_llm(text, api_key, model):
-    if anthropic is None:
-        raise RuntimeError("`anthropic` package not installed. Run: pip install anthropic")
-    client = anthropic.Anthropic(api_key=api_key)
-    msg = client.messages.create(
-        model=model, max_tokens=6000, system=rubric_prompt(),
-        messages=[{"role": "user", "content": "SUPPLIER RESPONSE:\n\n" + text[:120000]}],
+    if openai is None:
+        raise RuntimeError("`openai` package not installed. Run: pip install openai")
+    client = openai.OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model, max_completion_tokens=6000,
+        messages=[
+            {"role": "system", "content": rubric_prompt()},
+            {"role": "user", "content": "SUPPLIER RESPONSE:\n\n" + text[:120000]},
+        ],
     )
-    out = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    out = response.choices[0].message.content
+    if not out:
+        raise RuntimeError("OpenAI returned an empty response.")
     data = parse_json(out)
-    data["_tokens"] = (msg.usage.input_tokens, msg.usage.output_tokens)
+    usage = response.usage
+    data["_tokens"] = (
+        usage.prompt_tokens if usage else 0,
+        usage.completion_tokens if usage else 0,
+    )
     return data
 
 
@@ -266,7 +282,7 @@ def run_evaluation(resp_id, mode, api_key, model):
     t0 = time.time()
     status, err, data = "ok", "", None
     try:
-        data = evaluate_llm(r["text"], api_key, model) if mode == "AI (Claude API)" else evaluate_heuristic(r["text"])
+        data = evaluate_llm(r["text"], api_key, model) if mode.startswith("AI") else evaluate_heuristic(r["text"])
     except Exception as e:  # noqa
         status, err = "error", str(e)[:500]
     dur = round(time.time() - t0, 2)
@@ -468,14 +484,14 @@ def page_run(api_key, model):
         return
     labels = {int(r.id): f"#{r.id} - {r.supplier} - {r.rfp_ref or 'no ref'} ({r.filename})" for r in resp.itertuples()}
     chosen = st.multiselect("Responses to evaluate", list(labels), format_func=labels.get, default=list(labels)[:1])
-    mode = st.radio("Evaluation mode", ["AI (Claude API)", "Offline heuristic (no key, rough triage)"], horizontal=True)
+    mode = st.radio("Evaluation mode", ["AI (OpenAI API)", "Offline heuristic (no key, rough triage)"], horizontal=True)
     auto = st.checkbox("Auto-add extracted batteries / materials to the Batteries tab", value=True)
     if mode.startswith("AI") and not api_key:
-        st.warning("Enter your Anthropic API key in the sidebar to use AI mode.")
+        st.warning("Enter your OpenAI API key in the sidebar to use AI mode.")
     if st.button("Run evaluator", type="primary", disabled=not chosen or (mode.startswith("AI") and not api_key)):
         bar = st.progress(0.0)
         for i, rid in enumerate(chosen, 1):
-            run_id, ext = run_evaluation(rid, "AI (Claude API)" if mode.startswith("AI") else "Heuristic", api_key, model)
+            run_id, ext = run_evaluation(rid, "AI (OpenAI API)" if mode.startswith("AI") else "Heuristic", api_key, model)
             r = query("SELECT * FROM runs WHERE id=?", (run_id,)).iloc[0]
             if r["status"] == "error":
                 st.error(f"{labels[rid]}: {r['error']}")
@@ -712,10 +728,36 @@ def main():
     with st.sidebar:
         st.markdown(SUV_SVG, unsafe_allow_html=True)
         st.subheader("🔑 API key")
-        key = st.text_input("Anthropic API key", type="password", value=st.session_state.get("api_key", os.environ.get("ANTHROPIC_API_KEY", "")),
+        key = st.text_input("OpenAI API key", type="password",
+                            value=st.session_state.get("openai_api_key", os.environ.get("OPENAI_API_KEY", "")),
                             help="Held in this browser session only. It is never written to the database.")
-        st.session_state["api_key"] = key
-        model = st.text_input("Model", value=st.session_state.get("model", "claude-sonnet-5-5"))
+        st.session_state["openai_api_key"] = key
+        refresh_models = st.button("Refresh available models", disabled=not key)
+        if not key:
+            st.session_state["_openai_models_key"] = ""
+            st.session_state["_openai_models"] = []
+            st.session_state["_openai_models_error"] = ""
+        elif key != st.session_state.get("_openai_models_key") or refresh_models:
+            st.session_state.pop("openai_model_choice", None)
+            try:
+                st.session_state["_openai_models"] = list_openai_models(key)
+                st.session_state["_openai_models_error"] = ""
+            except RuntimeError as e:
+                st.session_state["_openai_models"] = []
+                st.session_state["_openai_models_error"] = str(e)
+            except openai.OpenAIError as e:
+                st.session_state["_openai_models"] = []
+                st.session_state["_openai_models_error"] = str(e)
+            st.session_state["_openai_models_key"] = key
+        if st.session_state.get("_openai_models_error"):
+            st.error("Could not load OpenAI models. You can still enter a model ID manually. "
+                     + st.session_state["_openai_models_error"])
+        model_options = ["Enter model ID manually"] + st.session_state.get("_openai_models", [])
+        model_choice = st.selectbox("OpenAI model", model_options, key="openai_model_choice")
+        if model_choice == "Enter model ID manually":
+            model = st.text_input("Model ID", value=st.session_state.get("model", "gpt-4o-mini"))
+        else:
+            model = model_choice
         st.session_state["model"] = model
         st.caption("Key status: " + ("✅ entered" if key else "❌ missing (offline heuristic mode still works)"))
         st.divider()
