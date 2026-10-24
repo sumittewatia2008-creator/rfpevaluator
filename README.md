@@ -2,7 +2,7 @@
 
 A Streamlit app for importing supplier responses and evaluating them against
 the EV battery RFP rubric. It supports PDF, DOCX, TXT, and Markdown uploads,
-offline keyword triage, and optional AI evaluation with the OpenAI API.
+and AI evaluation with the OpenAI API.
 
 ## Run locally
 
@@ -15,10 +15,9 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app opens in your browser. AI evaluation requires an OpenAI API key;
-enter it in the app's sidebar. The available models for the key are loaded
-from OpenAI, and a model ID can also be entered manually. The offline heuristic
-mode works without a key.
+The app opens in your browser. Enter your OpenAI API key in the sidebar to run
+evaluations. The app uses the `gpt-4o-mini` model automatically; no model
+selection or separate environment setup is needed.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -35,8 +34,8 @@ mode works without a key.
    Do not commit API keys or other secrets to GitHub. The app keeps the key in
    Streamlit session state and does not store it in its database.
 
-Offline heuristic mode is available after deployment without configuring an
-OpenAI API key.
+Supplier responses can be imported and viewed without a key, but running an
+evaluation requires an OpenAI API key.
 
 ## Publish to GitHub
 
