@@ -2,7 +2,7 @@
 
 A Streamlit app for importing supplier responses and evaluating them against
 the EV battery RFP rubric. It supports PDF, DOCX, TXT, and Markdown uploads,
-offline keyword triage, and optional AI evaluation with the Anthropic API.
+offline keyword triage, and optional AI evaluation with the OpenAI API.
 
 ## Run locally
 
@@ -15,8 +15,10 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app opens in your browser. AI evaluation requires an Anthropic API key;
-enter it in the app's sidebar. The offline heuristic mode works without a key.
+The app opens in your browser. AI evaluation requires an OpenAI API key;
+enter it in the app's sidebar. The available models for the key are loaded
+from OpenAI, and a model ID can also be entered manually. The offline heuristic
+mode works without a key.
 
 ## Deploy on Streamlit Community Cloud
 
@@ -29,12 +31,12 @@ enter it in the app's sidebar. The offline heuristic mode works without a key.
    to `app.py`.
 4. Deploy. Streamlit Cloud installs the packages listed in
    `requirements.txt`.
-5. To use AI evaluation, enter your Anthropic API key in the app's sidebar.
+5. To use AI evaluation, enter your OpenAI API key in the app's sidebar.
    Do not commit API keys or other secrets to GitHub. The app keeps the key in
    Streamlit session state and does not store it in its database.
 
 Offline heuristic mode is available after deployment without configuring an
-Anthropic API key.
+OpenAI API key.
 
 ## Publish to GitHub
 
